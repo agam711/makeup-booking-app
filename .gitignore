@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+
+# Environment variables (contains secrets)
+.env
+
+# SQLite database
+bookings.db
+
+# Build output
+client/dist/
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Logs
+*.log
+npm-debug.log*
+
+# IDE
+.vscode/
+.idea/
