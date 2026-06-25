@@ -2,56 +2,89 @@ require("dotenv").config();
 const express    = require("express");
 const path       = require("path");
 const cors       = require("cors");
-const bcrypt     = require("bcryptjs");
+const crypto     = require("crypto");
+const util       = require("util");
 const jwt        = require("jsonwebtoken");
-const Database   = require("better-sqlite3");
+const mysql      = require("mysql2/promise");
 const { google } = require("googleapis");
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-please-change-in-production";
 
-/* ─── DATABASE ───────────────────────────────────────────────── */
-const db = new Database(path.join(__dirname, "../bookings.db"));
+const scrypt = util.promisify(crypto.scrypt);
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS admins (
-    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
-    name                 TEXT    NOT NULL,
-    email                TEXT    UNIQUE NOT NULL,
-    password_hash        TEXT    NOT NULL,
-    google_refresh_token TEXT,
-    created_at           DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
+/* ─── CRYPTO PASSWORD HELPERS ────────────────────────────────── */
+async function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString("hex");
+  const derivedKey = await scrypt(password, salt, 64);
+  return `${salt}:${derivedKey.toString("hex")}`;
+}
 
-  CREATE TABLE IF NOT EXISTS app_config (
-    admin_id   INTEGER PRIMARY KEY,
-    config_json TEXT   NOT NULL DEFAULT '{}',
-    updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (admin_id) REFERENCES admins(id)
-  );
+async function verifyPassword(password, hash) {
+  if (!hash || !hash.includes(":")) return false;
+  const [salt, key] = hash.split(":");
+  const derivedKey = await scrypt(password, salt, 64);
+  return crypto.timingSafeEqual(Buffer.from(key, "hex"), derivedKey);
+}
 
-  CREATE TABLE IF NOT EXISTS bookings (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    admin_id        INTEGER NOT NULL,
-    booking_ref     TEXT    UNIQUE NOT NULL,
-    customer_name   TEXT    NOT NULL,
-    customer_phone  TEXT    NOT NULL,
-    service_name    TEXT    NOT NULL,
-    service_price   INTEGER NOT NULL,
-    addons_json     TEXT    DEFAULT '[]',
-    event_date      TEXT    NOT NULL,
-    event_time      TEXT    NOT NULL,
-    location        TEXT    NOT NULL,
-    eo_contact      TEXT,
-    notes           TEXT,
-    total_price     INTEGER NOT NULL,
-    status          TEXT    DEFAULT 'pending',
-    calendar_event_id TEXT,
-    created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (admin_id) REFERENCES admins(id)
-  );
-`);
+/* ─── DATABASE POOL ──────────────────────────────────────────── */
+const pool = mysql.createPool({
+  host: process.env.DB_HOST || "127.0.0.1",
+  port: parseInt(process.env.DB_PORT) || 3306,
+  user: process.env.DB_USER || "root",
+  password: process.env.DB_PASSWORD || "",
+  database: process.env.DB_NAME || "makeup_booking",
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0
+});
+
+// Database initialization
+async function initDB() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS admins (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      name VARCHAR(255) NOT NULL,
+      email VARCHAR(255) UNIQUE NOT NULL,
+      password_hash VARCHAR(255) NOT NULL,
+      google_refresh_token TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS app_config (
+      admin_id INT PRIMARY KEY,
+      config_json TEXT NOT NULL,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      FOREIGN KEY (admin_id) REFERENCES admins(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS bookings (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      admin_id INT NOT NULL,
+      booking_ref VARCHAR(50) UNIQUE NOT NULL,
+      customer_name VARCHAR(255) NOT NULL,
+      customer_phone VARCHAR(50) NOT NULL,
+      service_name VARCHAR(255) NOT NULL,
+      service_price INT NOT NULL,
+      addons_json TEXT,
+      event_date VARCHAR(50) NOT NULL,
+      event_time VARCHAR(50) NOT NULL,
+      location VARCHAR(255) NOT NULL,
+      eo_contact VARCHAR(255),
+      notes TEXT,
+      total_price INT NOT NULL,
+      status VARCHAR(50) DEFAULT 'pending',
+      calendar_event_id VARCHAR(255),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (admin_id) REFERENCES admins(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+  `);
+}
 
 /* ─── MIDDLEWARE ─────────────────────────────────────────────── */
 app.use(cors({ origin: process.env.CLIENT_URL || "http://localhost:5173", credentials: true }));
@@ -130,7 +163,7 @@ const getAvailableFromBusy = (busyTimes) => {
 
 /* ═══════════════════════════════════════════════════════════════
    AUTH ROUTES
-═══════════════════════════════════════════════════════════════ */
+   ═══════════════════════════════════════════════════════════════ */
 app.post("/api/auth/register", async (req, res) => {
   try {
     const { name, email, password } = req.body;
@@ -139,16 +172,20 @@ app.post("/api/auth/register", async (req, res) => {
     if (password.length < 6)
       return res.status(400).json({ error: "Password must be at least 6 characters." });
 
-    const existing = db.prepare("SELECT id FROM admins WHERE email = ?").get(email);
-    if (existing) return res.status(409).json({ error: "Email already registered." });
+    const [existingRows] = await pool.execute("SELECT id FROM admins WHERE email = ?", [email]);
+    if (existingRows.length > 0) return res.status(409).json({ error: "Email already registered." });
 
-    const hash = await bcrypt.hash(password, 12);
-    const { lastInsertRowid: id } = db
-      .prepare("INSERT INTO admins (name, email, password_hash) VALUES (?, ?, ?)")
-      .run(name, email, hash);
+    const hash = await hashPassword(password);
+    const [result] = await pool.execute(
+      "INSERT INTO admins (name, email, password_hash) VALUES (?, ?, ?)",
+      [name, email, hash]
+    );
+    const id = result.insertId;
 
-    db.prepare("INSERT INTO app_config (admin_id, config_json) VALUES (?, ?)")
-      .run(id, JSON.stringify(DEFAULT_CONFIG));
+    await pool.execute(
+      "INSERT INTO app_config (admin_id, config_json) VALUES (?, ?)",
+      [id, JSON.stringify(DEFAULT_CONFIG)]
+    );
 
     const token = jwt.sign({ id, email, name }, JWT_SECRET, { expiresIn: "30d" });
     res.json({ token, user: { id, name, email } });
@@ -161,10 +198,11 @@ app.post("/api/auth/register", async (req, res) => {
 app.post("/api/auth/login", async (req, res) => {
   try {
     const { email, password } = req.body;
-    const admin = db.prepare("SELECT * FROM admins WHERE email = ?").get(email);
+    const [rows] = await pool.execute("SELECT * FROM admins WHERE email = ?", [email]);
+    const admin = rows[0];
     if (!admin) return res.status(401).json({ error: "Invalid email or password." });
 
-    const ok = await bcrypt.compare(password, admin.password_hash);
+    const ok = await verifyPassword(password, admin.password_hash);
     if (!ok) return res.status(401).json({ error: "Invalid email or password." });
 
     const token = jwt.sign(
@@ -174,47 +212,68 @@ app.post("/api/auth/login", async (req, res) => {
     );
     res.json({ token, user: { id: admin.id, name: admin.name, email: admin.email } });
   } catch (err) {
+    console.error("Login error:", err);
     res.status(500).json({ error: "Login failed." });
   }
 });
 
-app.get("/api/auth/me", requireAuth, (req, res) => {
-  const admin = db.prepare("SELECT id, name, email, google_refresh_token FROM admins WHERE id = ?").get(req.admin.id);
-  if (!admin) return res.status(404).json({ error: "Not found." });
-  res.json({ id: admin.id, name: admin.name, email: admin.email, calendarConnected: !!admin.google_refresh_token });
-});
-
-/* ═══════════════════════════════════════════════════════════════
-   CONFIG ROUTES
-═══════════════════════════════════════════════════════════════ */
-
-// Public — booking page loads this
-app.get("/api/config", (req, res) => {
-  const adminId = parseInt(req.query.adminId) || 1;
-  const row = db.prepare("SELECT config_json FROM app_config WHERE admin_id = ?").get(adminId);
-  res.json(row ? JSON.parse(row.config_json) : DEFAULT_CONFIG);
-});
-
-// Admin only — save settings
-app.put("/api/config", requireAuth, (req, res) => {
+app.get("/api/auth/me", requireAuth, async (req, res) => {
   try {
-    const { config } = req.body;
-    const exists = db.prepare("SELECT admin_id FROM app_config WHERE admin_id = ?").get(req.admin.id);
-    if (exists) {
-      db.prepare("UPDATE app_config SET config_json = ?, updated_at = CURRENT_TIMESTAMP WHERE admin_id = ?")
-        .run(JSON.stringify(config), req.admin.id);
-    } else {
-      db.prepare("INSERT INTO app_config (admin_id, config_json) VALUES (?, ?)").run(req.admin.id, JSON.stringify(config));
-    }
-    res.json({ success: true });
+    const [rows] = await pool.execute(
+      "SELECT id, name, email, google_refresh_token FROM admins WHERE id = ?",
+      [req.admin.id]
+    );
+    const admin = rows[0];
+    if (!admin) return res.status(404).json({ error: "Not found." });
+    res.json({ id: admin.id, name: admin.name, email: admin.email, calendarConnected: !!admin.google_refresh_token });
   } catch (err) {
-    res.status(500).json({ error: "Failed to save config." });
+    console.error("Auth me error:", err);
+    res.status(500).json({ error: "Failed to fetch user profile." });
   }
 });
 
 /* ═══════════════════════════════════════════════════════════════
-   GOOGLE CALENDAR ROUTES
-═══════════════════════════════════════════════════════════════ */
+   CONFIG ROUTES
+   ═══════════════════════════════════════════════════════════════ */
+
+// Public — booking page loads this
+app.get("/api/config", async (req, res) => {
+  try {
+    const adminId = parseInt(req.query.adminId) || 1;
+    const [rows] = await pool.execute("SELECT config_json FROM app_config WHERE admin_id = ?", [adminId]);
+    const row = rows[0];
+    res.json(row ? JSON.parse(row.config_json) : DEFAULT_CONFIG);
+  } catch (err) {
+    console.error("Get config error:", err);
+    res.json(DEFAULT_CONFIG);
+  }
+});
+
+// Admin only — save settings
+app.put("/api/config", requireAuth, async (req, res) => {
+  try {
+    const { config } = req.body;
+    const [rows] = await pool.execute("SELECT admin_id FROM app_config WHERE admin_id = ?", [req.admin.id]);
+    const exists = rows[0];
+    if (exists) {
+      await pool.execute(
+        "UPDATE app_config SET config_json = ? WHERE admin_id = ?",
+        [JSON.stringify(config), req.admin.id]
+      );
+    } else {
+      await pool.execute(
+        "INSERT INTO app_config (admin_id, config_json) VALUES (?, ?)",
+        [req.admin.id, JSON.stringify(config)]
+      );
+    }
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Save config error:", err);
+    res.status(500).json({ error: "Failed to save config." });
+  }
+});
+
+/* ─── GOOGLE CALENDAR ROUTES ────────────────────────────────── */
 
 // Start OAuth flow — returns Google auth URL
 app.get("/api/calendar/connect", requireAuth, (req, res) => {
@@ -238,8 +297,10 @@ app.get("/api/calendar/callback", async (req, res) => {
     const { tokens } = await oauth2.getToken(code);
     const refreshToken = tokens.refresh_token || tokens.access_token;
 
-    db.prepare("UPDATE admins SET google_refresh_token = ? WHERE id = ?")
-      .run(refreshToken, parseInt(adminId));
+    await pool.execute(
+      "UPDATE admins SET google_refresh_token = ? WHERE id = ?",
+      [refreshToken, parseInt(adminId)]
+    );
 
     res.send(`
       <html><body style="font-family:sans-serif;text-align:center;padding:40px;background:#FFF0F7;color:#8B3A6E">
@@ -261,16 +322,23 @@ app.get("/api/calendar/callback", async (req, res) => {
 });
 
 // Calendar connection status
-app.get("/api/calendar/status", requireAuth, (req, res) => {
-  const admin = db.prepare("SELECT google_refresh_token FROM admins WHERE id = ?").get(req.admin.id);
-  res.json({ connected: !!admin?.google_refresh_token });
+app.get("/api/calendar/status", requireAuth, async (req, res) => {
+  try {
+    const [rows] = await pool.execute("SELECT google_refresh_token FROM admins WHERE id = ?", [req.admin.id]);
+    const admin = rows[0];
+    res.json({ connected: !!admin?.google_refresh_token });
+  } catch (err) {
+    console.error("Calendar status error:", err);
+    res.status(500).json({ error: "Failed to get calendar status." });
+  }
 });
 
 // Public — get available dates for a given admin
 app.get("/api/calendar/available", async (req, res) => {
   try {
     const adminId = parseInt(req.query.adminId) || 1;
-    const admin = db.prepare("SELECT google_refresh_token FROM admins WHERE id = ?").get(adminId);
+    const [rows] = await pool.execute("SELECT google_refresh_token FROM admins WHERE id = ?", [adminId]);
+    const admin = rows[0];
 
     if (!admin?.google_refresh_token || !process.env.GOOGLE_CLIENT_ID) {
       return res.json({ availableDates: getFallbackDates(), source: "fallback" });
@@ -303,7 +371,8 @@ app.get("/api/calendar/available", async (req, res) => {
 app.post("/api/calendar/event", async (req, res) => {
   try {
     const { adminId, booking } = req.body;
-    const admin = db.prepare("SELECT google_refresh_token FROM admins WHERE id = ?").get(parseInt(adminId));
+    const [rows] = await pool.execute("SELECT google_refresh_token FROM admins WHERE id = ?", [parseInt(adminId)]);
+    const admin = rows[0];
 
     if (!admin?.google_refresh_token || !process.env.GOOGLE_CLIENT_ID) {
       return res.json({ success: false, reason: "Calendar not connected" });
@@ -342,8 +411,10 @@ app.post("/api/calendar/event", async (req, res) => {
     });
 
     if (booking.bookingRef) {
-      db.prepare("UPDATE bookings SET calendar_event_id = ?, status = 'confirmed' WHERE booking_ref = ?")
-        .run(event.data.id, booking.bookingRef);
+      await pool.execute(
+        "UPDATE bookings SET calendar_event_id = ?, status = 'confirmed' WHERE booking_ref = ?",
+        [event.data.id, booking.bookingRef]
+      );
     }
 
     res.json({ success: true, eventId: event.data.id });
@@ -355,20 +426,20 @@ app.post("/api/calendar/event", async (req, res) => {
 
 /* ═══════════════════════════════════════════════════════════════
    BOOKINGS ROUTES
-═══════════════════════════════════════════════════════════════ */
+   ═══════════════════════════════════════════════════════════════ */
 
 // Public — submit a booking
-app.post("/api/bookings", (req, res) => {
+app.post("/api/bookings", async (req, res) => {
   try {
     const { adminId, booking } = req.body;
     const ref = `MKP-${Date.now().toString().slice(-6)}`;
 
-    db.prepare(`
+    await pool.execute(`
       INSERT INTO bookings
         (admin_id, booking_ref, customer_name, customer_phone, service_name, service_price,
          addons_json, event_date, event_time, location, eo_contact, notes, total_price)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
+    `, [
       parseInt(adminId), ref,
       booking.customerName, booking.customerPhone,
       booking.serviceName, booking.servicePrice,
@@ -378,7 +449,7 @@ app.post("/api/bookings", (req, res) => {
       booking.eoContact || "",
       booking.notes    || "",
       booking.totalPrice
-    );
+    ]);
 
     res.json({ success: true, bookingRef: ref });
   } catch (err) {
@@ -388,24 +459,46 @@ app.post("/api/bookings", (req, res) => {
 });
 
 // Admin only — list all bookings
-app.get("/api/bookings", requireAuth, (req, res) => {
-  const rows = db.prepare(
-    "SELECT * FROM bookings WHERE admin_id = ? ORDER BY created_at DESC"
-  ).all(req.admin.id);
-  res.json(rows.map(b => ({ ...b, addons: JSON.parse(b.addons_json || "[]") })));
+app.get("/api/bookings", requireAuth, async (req, res) => {
+  try {
+    const [rows] = await pool.execute(
+      "SELECT * FROM bookings WHERE admin_id = ? ORDER BY created_at DESC",
+      [req.admin.id]
+    );
+    res.json(rows.map(b => ({ ...b, addons: JSON.parse(b.addons_json || "[]") })));
+  } catch (err) {
+    console.error("Get bookings error:", err);
+    res.status(500).json({ error: "Failed to fetch bookings." });
+  }
 });
 
 /* ═══════════════════════════════════════════════════════════════
    SERVE REACT APP IN PRODUCTION
-═══════════════════════════════════════════════════════════════ */
+   ═══════════════════════════════════════════════════════════════ */
 if (process.env.NODE_ENV === "production") {
   const dist = path.join(__dirname, "../client/dist");
   app.use(express.static(dist));
   app.get("*", (req, res) => res.sendFile(path.join(dist, "index.html")));
 }
 
-app.listen(PORT, () => {
-  console.log(`\n🌸 Makeup Booking Server`);
-  console.log(`   Running → http://localhost:${PORT}`);
-  console.log(`   Mode    → ${process.env.NODE_ENV || "development"}\n`);
-});
+/* ─── STARTUP ────────────────────────────────────────────────── */
+async function startServer() {
+  try {
+    // 1. Auto-create database tables if not existing
+    console.log("Checking and initializing MySQL database...");
+    await initDB();
+    console.log("Database initialized successfully.");
+
+    // 2. Start listening
+    app.listen(PORT, () => {
+      console.log(`\n🌸 Makeup Booking Server`);
+      console.log(`   Running → http://localhost:${PORT}`);
+      console.log(`   Mode    → ${process.env.NODE_ENV || "development"}\n`);
+    });
+  } catch (err) {
+    console.error("Failed to initialize database and start server:", err);
+    process.exit(1);
+  }
+}
+
+startServer();
